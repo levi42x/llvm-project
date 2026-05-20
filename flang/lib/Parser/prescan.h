@@ -68,6 +68,10 @@ public:
     fixedFormColumnLimit_ = limit;
     return *this;
   }
+  Prescanner &set_freeFormColumnLimit(int limit) {
+    freeFormColumnLimit_ = limit;
+    return *this;
+  }
 
   Prescanner &AddCompilerDirectiveSentinel(const std::string &);
 
@@ -269,6 +273,7 @@ private:
   bool backslashFreeFormContinuation_{false};
   bool inFixedForm_{false};
   int fixedFormColumnLimit_{72};
+  int freeFormColumnLimit_{10000};
   Encoding encoding_{Encoding::UTF_8};
   int parenthesisNesting_{0};
   int prescannerNesting_{0};
@@ -324,7 +329,6 @@ private:
   static const int prime1{1019}, prime2{1021};
   std::bitset<prime2> compilerDirectiveBloomFilter_; // 128 bytes
   std::unordered_set<std::string> compilerDirectiveSentinels_;
-  int maxSentinelLength_{0};
 };
 } // namespace Fortran::parser
 #endif // FORTRAN_PARSER_PRESCAN_H_

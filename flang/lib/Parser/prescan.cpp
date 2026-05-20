@@ -42,12 +42,12 @@ Prescanner::Prescanner(const Prescanner &that, Preprocessor &prepro,
       backslashFreeFormContinuation_{that.backslashFreeFormContinuation_},
       inFixedForm_{that.inFixedForm_},
       fixedFormColumnLimit_{that.fixedFormColumnLimit_},
+      freeFormColumnLimit_{that.freeFormColumnLimit_},
       encoding_{that.encoding_},
       prescannerNesting_{that.prescannerNesting_ + 1},
       skipLeadingAmpersand_{that.skipLeadingAmpersand_},
       compilerDirectiveBloomFilter_{that.compilerDirectiveBloomFilter_},
-      compilerDirectiveSentinels_{that.compilerDirectiveSentinels_},
-      maxSentinelLength_{that.maxSentinelLength_} {}
+      compilerDirectiveSentinels_{that.compilerDirectiveSentinels_} {}
 
 // Returns number of bytes to skip
 static inline int IsSpace(const char *p) {
@@ -569,6 +569,9 @@ void Prescanner::SkipToEndOfLine() {
 bool Prescanner::MustSkipToEndOfLine() const {
   if (inFixedForm_ && column_ > fixedFormColumnLimit_ && !tabInCurrentLine_) {
     return true; // skip over ignored columns in right margin (73:80)
+  } else if (!inFixedForm_ && (freeFormColumnLimit_ != 0) &&
+      column_ > freeFormColumnLimit_) {
+    return true;
   } else if (*at_ == '!' && !inCharLiteral_ &&
       (!inFixedForm_ || tabInCurrentLine_ || column_ != 6)) {
     return InCompilerDirective() ||
@@ -1015,9 +1018,9 @@ void Prescanner::QuotedCharacterLiteral(
     if (*at_ == '\\') {
       if (escapesEnabled) {
         isEscaped = !isEscaped;
-      } else {
-        // The parser always processes escape sequences, so don't confuse it
-        // when escapes are disabled.
+      } else if (!preprocessingOnly_) {
+        // Except when -E is used, the parser always processes escape sequences,
+        // so don't confuse it when escapes are disabled.
         insert('\\');
       }
     } else {
@@ -1731,10 +1734,6 @@ Prescanner &Prescanner::AddCompilerDirectiveSentinel(const std::string &dir) {
   compilerDirectiveBloomFilter_.set(packed % prime1);
   compilerDirectiveBloomFilter_.set(packed % prime2);
   compilerDirectiveSentinels_.insert(dir);
-  int len{static_cast<int>(dir.size())};
-  if (len > maxSentinelLength_) {
-    maxSentinelLength_ = len;
-  }
   return *this;
 }
 
@@ -1789,19 +1788,15 @@ const char *Prescanner::IsCompilerDirectiveSentinel(CharBlock token) const {
   while (end > p && (end[-1] == ' ' || end[-1] == '\t')) {
     --end;
   }
-  if (end > p + maxSentinelLength_) {
-    end = p + maxSentinelLength_;
-  }
   return end > p && IsCompilerDirectiveSentinel(p, end - p) ? p : nullptr;
 }
 
 std::optional<std::pair<const char *, const char *>>
 Prescanner::IsCompilerDirectiveSentinel(const char *p) const {
   char sentinel[8];
-  std::size_t maxLen{static_cast<std::size_t>(maxSentinelLength_)};
   for (std::size_t j{0}; j + 1 < sizeof sentinel; ++p, ++j) {
     if (int n{IsSpaceOrTab(p)};
-        n || j >= maxLen || !(IsLetter(*p) || *p == '$' || *p == '@')) {
+        n || !(IsLetter(*p) || *p == '$' || *p == '@')) {
       if (j <= 1 && sentinel[0] == '$' && n == 0 && *p != '&' && *p != '\n') {
         // Free form OpenMP conditional compilation line sentinels have to
         // be immediately followed by a space or &, not a digit

@@ -462,7 +462,6 @@ static constexpr FeatureBitset XCVFeatureGroup = {
     RISCV::FeatureVendorXCVbi};
 
 static constexpr FeatureBitset XRivosFeatureGroup = {
-    RISCV::FeatureVendorXRivosVisni,
     RISCV::FeatureVendorXRivosVizip,
 };
 
@@ -580,6 +579,9 @@ static constexpr DecoderListEntry DecoderList16[]{
     {DecoderTableXqccmp16,
      {RISCV::FeatureVendorXqccmp},
      "Xqccmp (Qualcomm 16-bit Push/Pop & Double Move Instructions)"},
+    {DecoderTableXqccmt16,
+     {RISCV::FeatureVendorXqccmt},
+     "Xqccmt (Qualcomm 16-bit Table Jump Instructions)"},
     {DecoderTableXwchc16, {RISCV::FeatureVendorXwchc}, "WCH QingKe XW"},
     // Standard Extensions
     // DecoderTableZicfiss16 must be checked before DecoderTable16.

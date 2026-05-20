@@ -55,7 +55,6 @@ bool RecurrenceDescriptor::isIntegerRecurrenceKind(RecurKind Kind) {
   case RecurKind::UMin:
   case RecurKind::AnyOf:
   case RecurKind::FindIV:
-  // TODO: Make type-agnostic.
   case RecurKind::FindLast:
     return true;
   }
@@ -91,6 +90,10 @@ static Instruction *lookThroughAnd(PHINode *Phi, Type *&RT,
     }
   }
   return Phi;
+}
+
+bool RecurrenceDescriptor::isSubRecurrenceKind(RecurKind Kind) {
+  return Kind == RecurKind::Sub || Kind == RecurKind::FSub;
 }
 
 /// Compute the minimal bit width needed to represent a reduction whose exit
@@ -364,14 +367,12 @@ static RecurrenceDescriptor getMinMaxRecurrence(PHINode *Phi, Loop *TheLoop,
   // Validate chain entries and collect stores from chain entries and
   // intermediate ops.
   SmallVector<StoreInst *> Stores;
-  unsigned OutOfLoopUses = 0;
   for (Value *V : Chain) {
     for (User *U : V->users()) {
       if (Chain.contains(U))
         continue;
       auto *I = dyn_cast<Instruction>(U);
-      if (!I || (!TheLoop->contains(I) &&
-                 (V != BackedgeValue || ++OutOfLoopUses > 1)))
+      if (!I || (!TheLoop->contains(I) && V != BackedgeValue))
         return {};
       if (!TheLoop->contains(I))
         continue;
@@ -396,6 +397,8 @@ static RecurrenceDescriptor getMinMaxRecurrence(PHINode *Phi, Loop *TheLoop,
   StoreInst *IntermediateStore = nullptr;
   const SCEV *StorePtrSCEV = nullptr;
   for (StoreInst *SI : Stores) {
+    if (!SE)
+      return {};
     const SCEV *Ptr = SE->getSCEV(SI->getPointerOperand());
     if (!SE->isLoopInvariant(Ptr, TheLoop) ||
         (StorePtrSCEV && StorePtrSCEV != Ptr))
@@ -499,7 +502,12 @@ bool RecurrenceDescriptor::AddReductionVar(
   // to evaluate the reduction in the narrower width.
   // Check the scalar type to handle both scalar and vector types.
   Type *ScalarTy = RecurrenceType->getScalarType();
-  if (ScalarTy->isFloatingPointTy()) {
+  if (Kind == RecurKind::FindLast) {
+    // FindLast supports all primitive scalar types.
+    if (!ScalarTy->isFloatingPointTy() && !ScalarTy->isIntegerTy() &&
+        !ScalarTy->isPointerTy())
+      return false;
+  } else if (ScalarTy->isFloatingPointTy()) {
     if (!isFloatingPointRecurrenceKind(Kind))
       return false;
   } else if (ScalarTy->isIntegerTy()) {
@@ -923,12 +931,8 @@ RecurrenceDescriptor::isFindPattern(Loop *TheLoop, PHINode *OrigPhi,
   // We are looking for selects of the form:
   //   select(cmp(), phi, value) or
   //   select(cmp(), value, phi)
-  // TODO: Match selects with multi-use cmp conditions.
-  Value *NonRdxPhi = nullptr;
-  if (!match(I, m_CombineOr(m_Select(m_OneUse(m_Cmp()), m_Value(NonRdxPhi),
-                                     m_Specific(OrigPhi)),
-                            m_Select(m_OneUse(m_Cmp()), m_Specific(OrigPhi),
-                                     m_Value(NonRdxPhi)))))
+  if (!match(I, m_CombineOr(m_Select(m_Cmp(), m_Value(), m_Specific(OrigPhi)),
+                            m_Select(m_Cmp(), m_Specific(OrigPhi), m_Value()))))
     return InstDesc(false, I);
 
   return InstDesc(I, RecurKind::FindLast);
@@ -1009,13 +1013,18 @@ RecurrenceDescriptor::isRecurrenceInstr(Loop *L, PHINode *OrigPhi,
     return InstDesc(Kind == RecurKind::FMul, I,
                     I->hasAllowReassoc() ? nullptr : I);
   case Instruction::FSub:
+    return InstDesc(Kind == RecurKind::FSub ||
+                        Kind == RecurKind::FAddChainWithSubs,
+                    I, I->hasAllowReassoc() ? nullptr : I);
   case Instruction::FAdd:
-    return InstDesc(Kind == RecurKind::FAdd, I,
-                    I->hasAllowReassoc() ? nullptr : I);
+    return InstDesc(Kind == RecurKind::FAdd ||
+                        Kind == RecurKind::FAddChainWithSubs,
+                    I, I->hasAllowReassoc() ? nullptr : I);
   case Instruction::Select:
-    if (Kind == RecurKind::FAdd || Kind == RecurKind::FMul ||
-        Kind == RecurKind::Add || Kind == RecurKind::Mul ||
-        Kind == RecurKind::Sub || Kind == RecurKind::AddChainWithSubs)
+    if (isSubRecurrenceKind(Kind) || Kind == RecurKind::FAdd ||
+        Kind == RecurKind::FMul || Kind == RecurKind::Add ||
+        Kind == RecurKind::Mul || Kind == RecurKind::AddChainWithSubs ||
+        Kind == RecurKind::FAddChainWithSubs)
       return isConditionalRdxPattern(I);
     if (isFindRecurrenceKind(Kind) && SE)
       return isFindPattern(L, OrigPhi, I, *SE);
@@ -1104,8 +1113,18 @@ bool RecurrenceDescriptor::isReductionPHI(PHINode *Phi, Loop *TheLoop,
     LLVM_DEBUG(dbgs() << "Found an FMult reduction PHI." << *Phi << "\n");
     return true;
   }
+  if (AddReductionVar(Phi, RecurKind::FSub, TheLoop, RedDes, DB, AC, DT, SE)) {
+    LLVM_DEBUG(dbgs() << "Found an FSub reduction PHI." << *Phi << "\n");
+    return true;
+  }
   if (AddReductionVar(Phi, RecurKind::FAdd, TheLoop, RedDes, DB, AC, DT, SE)) {
     LLVM_DEBUG(dbgs() << "Found an FAdd reduction PHI." << *Phi << "\n");
+    return true;
+  }
+  if (AddReductionVar(Phi, RecurKind::FAddChainWithSubs, TheLoop, RedDes, DB,
+                      AC, DT, SE)) {
+    LLVM_DEBUG(dbgs() << "Found a chained FADD-FSUB chained reduction PHI."
+                      << *Phi << "\n");
     return true;
   }
   if (AddReductionVar(Phi, RecurKind::FMulAdd, TheLoop, RedDes, DB, AC, DT,
@@ -1224,8 +1243,11 @@ unsigned RecurrenceDescriptor::getOpcode(RecurKind Kind) {
   case RecurKind::FMul:
     return Instruction::FMul;
   case RecurKind::FMulAdd:
+  case RecurKind::FAddChainWithSubs:
   case RecurKind::FAdd:
     return Instruction::FAdd;
+  case RecurKind::FSub:
+    return Instruction::FSub;
   case RecurKind::SMax:
   case RecurKind::SMin:
   case RecurKind::UMax:
@@ -1300,6 +1322,10 @@ RecurrenceDescriptor::getReductionOpChain(PHINode *Phi, Loop *L) const {
 
     if (Cur->getOpcode() == Instruction::Sub &&
         Kind == RecurKind::AddChainWithSubs)
+      return true;
+
+    if (Cur->getOpcode() == Instruction::FSub &&
+        Kind == RecurKind::FAddChainWithSubs)
       return true;
 
     return Cur->getOpcode() == getOpcode();
@@ -1388,9 +1414,15 @@ InductionDescriptor::InductionDescriptor(Value *Start, InductionKind K,
     llvm::append_range(RedundantCasts, *Casts);
 }
 
+InductionDescriptor
+InductionDescriptor::getCanonicalIntInduction(Type *Ty, ScalarEvolution &SE) {
+  return InductionDescriptor(Constant::getNullValue(Ty), IK_IntInduction,
+                             SE.getOne(Ty));
+}
+
 ConstantInt *InductionDescriptor::getConstIntStepValue() const {
-  if (isa<SCEVConstant>(Step))
-    return dyn_cast<ConstantInt>(cast<SCEVConstant>(Step)->getValue());
+  if (auto *ConstStep = dyn_cast<SCEVConstant>(Step))
+    return ConstStep->getValue();
   return nullptr;
 }
 
