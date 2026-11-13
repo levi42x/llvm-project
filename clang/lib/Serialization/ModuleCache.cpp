@@ -8,6 +8,7 @@
 
 #include "clang/Serialization/ModuleCache.h"
 
+#include "clang/Basic/AtomicLineLogger.h"
 #include "clang/Serialization/InMemoryModuleCache.h"
 #include "clang/Serialization/ModuleFile.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -16,6 +17,8 @@
 #include "llvm/Support/IOSandbox.h"
 #include "llvm/Support/LockFileManager.h"
 #include "llvm/Support/Path.h"
+
+#include <chrono>
 
 using namespace clang;
 
@@ -56,14 +59,18 @@ static void writeTimestampFile(StringRef TimestampFile) {
 }
 
 void clang::maybePruneImpl(StringRef Path, time_t PruneInterval,
-                           time_t PruneAfter, bool PruneTopLevel) {
+                           time_t PruneAfter, bool PruneTopLevel,
+                           llvm::function_ref<void(StringRef)> OnPrune) {
   if (PruneInterval <= 0 || PruneAfter <= 0)
     return;
 
   // This is a compiler-internal input/output, let's bypass the sandbox.
   auto BypassSandbox = llvm::sys::sandbox::scopedDisable();
 
-  llvm::SmallString<128> TimestampFile(Path);
+  llvm::SmallString<256> RootPath(Path);
+  (void)llvm::sys::fs::make_absolute(RootPath);
+
+  llvm::SmallString<128> TimestampFile(RootPath);
   llvm::sys::path::append(TimestampFile, "modules.timestamp");
 
   // Try to stat() the timestamp file.
@@ -87,6 +94,11 @@ void clang::maybePruneImpl(StringRef Path, time_t PruneInterval,
   // There is a benign race condition here, if two Clang instances happen to
   // notice at the same time that the timestamp is out-of-date.
   writeTimestampFile(TimestampFile);
+
+  auto NotifyPruned = [&](StringRef RemovedPath) {
+    if (OnPrune)
+      OnPrune(RemovedPath);
+  };
 
   // Walk the entire module cache, looking for unused module files and module
   // indices.
@@ -114,14 +126,16 @@ void clang::maybePruneImpl(StringRef Path, time_t PruneInterval,
       return;
 
     // Remove the file.
-    llvm::sys::fs::remove(FilePath);
+    if (!llvm::sys::fs::remove(FilePath))
+      NotifyPruned(FilePath);
 
     // Remove the timestamp file created by implicit module builds.
     std::string TimestampFilename = FilePath.str() + ".timestamp";
-    llvm::sys::fs::remove(TimestampFilename);
+    if (!llvm::sys::fs::remove(TimestampFilename))
+      NotifyPruned(TimestampFilename);
   };
 
-  for (llvm::sys::fs::directory_iterator Dir(Path, EC), DirEnd;
+  for (llvm::sys::fs::directory_iterator Dir(RootPath, EC), DirEnd;
        Dir != DirEnd && !EC; Dir.increment(EC)) {
     // If we don't have a directory, try to prune it as a file in the root.
     if (!llvm::sys::fs::is_directory(Dir->path())) {
@@ -139,8 +153,10 @@ void clang::maybePruneImpl(StringRef Path, time_t PruneInterval,
     // itself.
     if (llvm::sys::fs::directory_iterator(Dir->path(), EC) ==
             llvm::sys::fs::directory_iterator() &&
-        !EC)
-      llvm::sys::fs::remove(Dir->path());
+        !EC) {
+      if (!llvm::sys::fs::remove(Dir->path()))
+        NotifyPruned(Dir->path());
+    }
   }
 }
 
@@ -171,6 +187,8 @@ std::error_code clang::writeImpl(StringRef Path, llvm::MemoryBufferRef Buffer,
   {
     llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true);
     OS << Buffer.getBuffer();
+    // Make sure all contents reach the file before querying its status.
+    OS.flush();
     // Using the status from an open file descriptor ensures this is not racy.
     if ((EC = llvm::sys::fs::status(FD, Status)))
       return EC;
@@ -184,6 +202,32 @@ std::error_code clang::writeImpl(StringRef Path, llvm::MemoryBufferRef Buffer,
     return EC;
 
   return {};
+}
+
+/// The access time of a module file is only refreshed explicitly when it is
+/// older than this interval so we avoid frequent yet unnecessary updates.
+static constexpr std::chrono::seconds AccessTimeRefreshInterval(60);
+
+/// Record that the module file open as \p FD has just been used by setting its
+/// access time to now, if it is older than AccessTimeRefreshInterval. Module
+/// cache pruning goes by access time, and file systems don't reliably update it
+/// when a file is read (e.g., Linux relatime).
+static void
+refreshAccessTime([[maybe_unused]] llvm::sys::fs::file_t FD,
+                  [[maybe_unused]] const llvm::sys::fs::file_status &Status) {
+// FIXME: Support Windows. The handle (FD) is opened for reading only, and
+// SetFileTime needs one with FILE_WRITE_ATTRIBUTES access.
+#ifndef _WIN32
+  llvm::sys::TimePoint<> Now = std::chrono::system_clock::now();
+  if (Now - Status.getLastAccessedTime() <= AccessTimeRefreshInterval)
+    return;
+
+  // Keep the modification time: modules importing this one record it.
+  // Go through the descriptor so a module file replaced meanwhile is left
+  // alone.
+  (void)llvm::sys::fs::setLastAccessAndModificationTime(
+      FD.get(), Now, Status.getLastModificationTime());
+#endif
 }
 
 Expected<std::unique_ptr<llvm::MemoryBuffer>>
@@ -203,14 +247,20 @@ clang::readImpl(StringRef FileName, off_t &Size, time_t &ModTime) {
     return llvm::errorCodeToError(Buf.getError());
   Size = Status.getSize();
   ModTime = llvm::sys::toTimeT(Status.getLastModificationTime());
+  refreshAccessTime(*FD, Status);
   return std::move(*Buf);
 }
 
 namespace {
+
+static AtomicLineLogger NoOpLogger;
 class CrossProcessModuleCache : public ModuleCache {
   InMemoryModuleCache InMemory;
 
 public:
+  explicit CrossProcessModuleCache()
+      : ModuleCache(NoOpLogger), InMemory(NoOpLogger) {}
+
   std::unique_ptr<llvm::AdvisoryLock>
   getLock(StringRef ModuleFilename) override {
     return std::make_unique<llvm::LockFileManager>(ModuleFilename);

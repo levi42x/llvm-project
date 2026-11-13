@@ -1196,6 +1196,19 @@ ErrorOr<perms> getPermissions(const Twine &Path) {
   return Status.permissions();
 }
 
+std::error_code setLastAccessAndModificationTime(const Twine &Path,
+                                                 TimePoint<> AccessTime,
+                                                 TimePoint<> ModificationTime) {
+  int FD;
+  if (std::error_code EC = openFile(Path, FD, CD_OpenExisting, FA_Read,
+                                    OF_UpdateAttributes | OF_OpenDirectory))
+    return EC;
+  std::error_code EC =
+      setLastAccessAndModificationTime(FD, AccessTime, ModificationTime);
+  Process::SafelyCloseFileDescriptor(FD);
+  return EC;
+}
+
 size_t mapped_file_region::size() const {
   assert(Mapping && "Mapping failed but used anyway!");
   return Size;
@@ -1327,9 +1340,9 @@ Error TempFile::keep(const Twine &Name) {
   if (RenameEC) {
     // If we can't rename, try to copy to work around cross-device link issues.
     RenameEC = sys::fs::copy_file(TmpName, Name);
-    // If we can't rename or copy, discard the temporary file.
-    if (RenameEC)
-      remove(TmpName);
+    // Whether the copy succeeded or not, the temporary file is no longer
+    // needed.
+    remove(TmpName);
   }
 #endif
   sys::DontRemoveFileOnSignal(TmpName);

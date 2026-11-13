@@ -18,9 +18,10 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/CodeGen/CommandFlags.h"
+#include "llvm/DTLTO/DTLTO.h"
 #include "llvm/IR/DiagnosticPrinter.h"
+#include "llvm/IR/ModuleSummaryIndex.h"
 #include "llvm/LTO/LTO.h"
-#include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Remarks/HotnessThresholdParser.h"
 #include "llvm/Support/Caching.h"
 #include "llvm/Support/CommandLine.h"
@@ -31,6 +32,7 @@
 #include "llvm/Support/Threading.h"
 #include "llvm/Support/TimeProfiler.h"
 #include <atomic>
+#include <list>
 
 using namespace llvm;
 using namespace lto;
@@ -207,8 +209,7 @@ static cl::list<std::string>
                 cl::desc("Load passes from plugin library"));
 
 static cl::opt<LTO::LTOKind> UnifiedLTOMode(
-    "unified-lto", cl::Optional,
-    cl::desc("Set LTO mode with the following options:"),
+    "unified-lto", cl::desc("Set LTO mode with the following options:"),
     cl::values(clEnumValN(LTO::LTOK_UnifiedThin, "thin",
                           "ThinLTO with Unified LTO enabled"),
                clEnumValN(LTO::LTOK_UnifiedRegular, "full",
@@ -293,7 +294,10 @@ static int usage() {
 }
 
 static int run(int argc, char **argv) {
-  cl::ParseCommandLineOptions(argc, argv, "Resolution-based LTO test harness");
+  cl::LibraryOptionsContext LibraryOptions;
+  cl::parseCommandLineOptions(LibraryOptions, codegen::getToolOptions(),
+                              ArrayRef(argv, argc),
+                              "Resolution-based LTO test harness");
 
   if (TimeTrace)
     timeTraceProfilerInitialize(TimeTraceGranularity, argv[0]);
@@ -342,16 +346,17 @@ static int run(int argc, char **argv) {
   std::vector<std::unique_ptr<MemoryBuffer>> MBs;
 
   Config Conf;
+  Conf.LibraryOptions = &LibraryOptions;
   if (TimeTrace) {
     Conf.TimeTraceEnabled = TimeTrace;
     Conf.TimeTraceGranularity = TimeTraceGranularity;
   }
-  Conf.CPU = codegen::getMCPU();
-  Conf.Options = codegen::InitTargetOptionsFromCodeGenFlags(Triple());
-  Conf.MAttrs = codegen::getMAttrs();
-  if (auto RM = codegen::getExplicitRelocModel())
+  Conf.CPU = codegen::getMCPU(LibraryOptions);
+  Conf.Options = codegen::getTargetOptions(LibraryOptions, Triple());
+  Conf.MAttrs = codegen::getMAttrs(LibraryOptions);
+  if (auto RM = codegen::getExplicitRelocModel(LibraryOptions))
     Conf.RelocModel = *RM;
-  Conf.CodeModel = codegen::getExplicitCodeModel();
+  Conf.CodeModel = codegen::getExplicitCodeModel(LibraryOptions);
 
   Conf.DebugPassManager = DebugPassManager;
 
@@ -397,7 +402,7 @@ static int run(int argc, char **argv) {
     return 1;
   }
 
-  if (auto FT = codegen::getExplicitFileType())
+  if (auto FT = codegen::getExplicitFileType(LibraryOptions))
     Conf.CGFileType = *FT;
 
   Conf.OverrideTriple = OverrideTriple;
@@ -451,13 +456,7 @@ static int run(int argc, char **argv) {
                                             ThinLTOEmitImports,
                                             /*LinkedObjectsFile=*/nullptr,
                                             /*OnWrite=*/{});
-  else if (!DTLTODistributor.empty()) {
-    Backend = createOutOfProcessThinBackend(
-        llvm::heavyweight_hardware_concurrency(Threads),
-        /*OnWrite=*/{}, ThinLTOEmitIndexes, ThinLTOEmitImports, OutputFilename,
-        DTLTODistributor, DTLTODistributorArgsSV, DTLTOCompiler,
-        DTLTOCompilerPrependArgsSV, DTLTOCompilerArgsSV, SaveTemps, AddBuffer);
-  } else
+  else
     Backend = createInProcessThinBackend(
         llvm::heavyweight_hardware_concurrency(Threads),
         /* OnWrite */ {}, ThinLTOEmitIndexes, ThinLTOEmitImports);
@@ -480,7 +479,17 @@ static int run(int argc, char **argv) {
 
   LTO::LTOKind LTOMode = UnifiedLTOMode;
 
-  LTO Lto(std::move(Conf), std::move(Backend), 1, LTOMode);
+  std::unique_ptr<LTO> Lto;
+  if (!DTLTODistributor.empty()) {
+    Lto = std::make_unique<DTLTO>(
+        std::move(Conf), 1, LTOMode, nullptr, ThinLTOEmitIndexes,
+        ThinLTOEmitImports, OutputFilename, DTLTODistributor,
+        DTLTODistributorArgsSV, DTLTOCompiler, DTLTOCompilerPrependArgsSV,
+        DTLTOCompilerArgsSV, AddBuffer, SaveTemps);
+  } else {
+    Lto =
+        std::make_unique<LTO>(std::move(Conf), std::move(Backend), 1, LTOMode);
+  }
 
   for (std::string F : InputFilenames) {
     std::unique_ptr<MemoryBuffer> MB = check(MemoryBuffer::getFile(F), F);
@@ -490,13 +499,19 @@ static int run(int argc, char **argv) {
     std::vector<SymbolResolution> Res;
     for (const InputFile::Symbol &Sym : Input->symbols()) {
       auto I = CommandLineResolutions.find({F, std::string(Sym.getName())});
-      // If it isn't found, look for ".", which would have been added
-      // (followed by a hash) when the symbol was promoted during module
-      // splitting if it was defined in one part and used in the other.
+      // If it isn't found, look for ".llvm." (or legacy "."), which would have
+      // been added (followed by a hash) when the symbol was promoted during
+      // module splitting if it was defined in one part and used in the other.
       // Try looking up the symbol name before the suffix.
       if (I == CommandLineResolutions.end()) {
-        auto SplitName = Sym.getName().rsplit(".");
-        I = CommandLineResolutions.find({F, std::string(SplitName.first)});
+        StringRef OrigName =
+            ModuleSummaryIndex::getOriginalNameBeforePromote(Sym.getName());
+        if (OrigName != Sym.getName())
+          I = CommandLineResolutions.find({F, std::string(OrigName)});
+        if (I == CommandLineResolutions.end()) {
+          auto SplitName = Sym.getName().rsplit(".");
+          I = CommandLineResolutions.find({F, std::string(SplitName.first)});
+        }
       }
       if (I == CommandLineResolutions.end()) {
         llvm::errs() << argv[0] << ": missing symbol resolution for " << F
@@ -514,7 +529,7 @@ static int run(int argc, char **argv) {
       continue;
 
     MBs.push_back(std::move(MB));
-    check(Lto.add(std::move(Input), Res), F);
+    check(Lto->add(std::move(Input), Res), F);
   }
 
   if (!CommandLineResolutions.empty()) {
@@ -527,15 +542,17 @@ static int run(int argc, char **argv) {
   if (HasErrors)
     return 1;
 
-  Lto.setBitcodeLibFuncs(
+  Lto->setBitcodeLibFuncs(
       SmallVector<StringRef>(BitcodeLibFuncs.begin(), BitcodeLibFuncs.end()));
 
   FileCache Cache;
   if (!CacheDir.empty())
-    Cache = check(localCache("ThinLTO", "Thin", CacheDir, AddBuffer),
+    Cache = check(localCache("ThinLTO", "Thin", CacheDir, AddBuffer,
+                             !DTLTODistributor.empty()),
                   "failed to create cache");
 
-  check(Lto.run(AddStream, Cache), "LTO::run failed");
+  check(Lto->run(AddStream, Cache), "LTO::run failed");
+  Lto->waitForCleanup();
   return static_cast<int>(HasErrors);
 }
 

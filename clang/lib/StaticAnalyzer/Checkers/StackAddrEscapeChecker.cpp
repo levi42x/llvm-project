@@ -457,8 +457,7 @@ void StackAddrEscapeChecker::checkEndFunction(const ReturnStmt *RS,
 
   ExplodedNode *Node = Ctx.getPredecessor();
 
-  bool ExitingTopFrame =
-      Ctx.getPredecessor()->getLocationContext()->inTopFrame();
+  bool ExitingTopFrame = Ctx.getPredecessor()->getStackFrame()->inTopFrame();
 
   if (ExitingTopFrame &&
       Node->getLocation().getTag() == ExprEngine::cleanupNodeTag() &&
@@ -586,7 +585,7 @@ void StackAddrEscapeChecker::checkEndFunction(const ReturnStmt *RS,
 
     // Generate a report for this bug.
     const StringRef CommonSuffix =
-        " upon returning to the caller.  This will be a dangling reference";
+        " upon returning to the caller; this will be a dangling reference";
     SmallString<128> Buf;
     llvm::raw_svector_ostream Out(Buf);
     const SourceRange Range = genName(Out, Referred, Ctx.getASTContext());

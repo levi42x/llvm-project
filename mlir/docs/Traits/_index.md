@@ -179,6 +179,24 @@ def OpWithInferTypeInterfaceOp : Op<...[MyTrait, MyParametricTrait<10>]> { ... }
 See the documentation on [operation definitions](../DefiningDialects/Operations.md) for more
 details.
 
+The C++ headers declaring a trait can be specified with the `cppIncludes` list.
+The generated declarations of every op, attribute, or type using the trait then
+include these headers, making them independent of the include order in the
+surrounding header:
+
+```tablegen
+def MyTrait : NativeOpTrait<"MyTrait"> {
+  let cppIncludes = ["MyDialect/MyTrait.h"];
+}
+```
+
+Each header is emitted verbatim as `#include "<header>"`, so it must consist of
+printable ASCII characters and must not contain `"`, `\`, `/*`, or `//`.
+
+The same field is available on interfaces (see the
+[interface documentation](../Interfaces.md)) and is also used to include the
+headers of base interfaces in generated interface declarations.
+
 ## Using a Trait
 
 Traits may be used to provide additional methods, static fields, or other
@@ -349,3 +367,17 @@ This trait removes the requirement on regions held by an operation to have
 [terminator operations](../LangRef.md/#control-flow-and-ssacfg-regions) at the end of a block.
 This requires that these regions have a single block. An example of operation
 using this trait is the top-level `ModuleOp`.
+
+### TokenProducerTrait
+
+*   `OpTrait::TokenProducerTrait` -- `TokenProducerTrait`
+
+This trait marks operations that are allowed to produce builtin `token` values
+as operation results or as region entry block arguments.
+
+### TokenConsumerTrait
+
+*   `OpTrait::TokenConsumerTrait` -- `TokenConsumerTrait`
+
+This trait marks operations that are allowed to consume builtin `token` values
+as operands.

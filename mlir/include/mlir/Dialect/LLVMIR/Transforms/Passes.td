@@ -58,16 +58,12 @@ def LLVMUseDefaultVisibilityPass
       [Option<"useVisibility", "visibility", "::mlir::LLVM::Visibility",
               /*default=*/"::mlir::LLVM::Visibility::Default",
               "Visibility to use in place of default.", [{::llvm::cl::values(
-	     clEnumValN(::mlir::LLVM::Visibility::Hidden, "hidden", "Hidden"),
-	     clEnumValN(::mlir::LLVM::Visibility::Protected, "protected", "Protected")
+       clEnumValN(::mlir::LLVM::Visibility::Hidden, "hidden", "Hidden"),
+       clEnumValN(::mlir::LLVM::Visibility::Protected, "protected", "Protected"),
+       clEnumValN(::mlir::LLVM::Visibility::Default, "default", "Default")
 	   )}]>,
   ];
 }
-
-def NVVMOptimizeForTargetPass : Pass<"llvm-optimize-for-nvvm-target"> {
-  let summary = "Optimize NVVM IR";
-}
-
 def DIScopeForLLVMFuncOpPass : Pass<"ensure-debug-info-scope-on-llvm-func", "::mlir::ModuleOp"> {
   let summary = "Materialize LLVM debug info subprogram attribute on every LLVMFuncOp";
   let description = [{

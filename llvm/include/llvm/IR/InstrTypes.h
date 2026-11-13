@@ -1250,6 +1250,10 @@ public:
   removeOperandBundle(CallBase *CB, uint32_t ID,
                       InsertPosition InsertPt = nullptr);
 
+  LLVM_ABI static CallBase *
+  removeOperandBundleAt(CallBase *CB, size_t Offset,
+                        InsertPosition InsertPtr = nullptr);
+
   /// Return the convergence control token for this call, if it exists.
   Value *getConvergenceControlToken() const {
     if (auto Bundle = getOperandBundle(llvm::LLVMContext::OB_convergencectrl)) {
@@ -1583,6 +1587,12 @@ public:
   void addParamAttrs(unsigned ArgNo, const AttrBuilder &B) {
     assert(ArgNo < arg_size() && "Out of bounds");
     Attrs = Attrs.addParamAttributes(getContext(), ArgNo, B);
+  }
+
+  /// Adds the attribute to the indicated argument
+  void maybeAddParamAttr(unsigned ArgNo, Attribute::AttrKind Kind) {
+    assert(ArgNo < arg_size() && "Out of bounds");
+    Attrs = Attrs.maybeAddParamAttribute(getContext(), ArgNo, Kind);
   }
 
   /// removes the attribute from the list of attributes.
@@ -1975,9 +1985,15 @@ public:
   /// Determine if the call requires strict floating point semantics.
   bool isStrictFP() const { return hasFnAttr(Attribute::StrictFP); }
 
-  /// Return true if the call should not be inlined.
-  bool isNoInline() const { return hasFnAttr(Attribute::NoInline); }
+  /// Return true if the call should not be inlined, either because the call
+  /// site is marked noinline or because the callee should not be inlined (see
+  /// Function::isNoInline).
+  LLVM_ABI bool isNoInline() const;
   void setIsNoInline() { addFnAttr(Attribute::NoInline); }
+
+  /// Return true if this is a call to an intrinsic with a volatile flag that
+  /// is set, e.g., a volatile memcpy.
+  LLVM_ABI bool isVolatile() const;
 
   LLVM_ABI MemoryEffects getMemoryEffects() const;
   LLVM_ABI void setMemoryEffects(MemoryEffects ME);
@@ -2347,6 +2363,18 @@ public:
   /// Return the range [\p bundle_op_info_begin, \p bundle_op_info_end).
   iterator_range<const_bundle_op_iterator> bundle_op_infos() const {
     return make_range(bundle_op_info_begin(), bundle_op_info_end());
+  }
+
+  auto operand_bundles() const {
+    return map_range(bundle_op_infos(), [this](BundleOpInfo BOI) {
+      return operandBundleFromBundleOpInfo(BOI);
+    });
+  }
+
+  /// Return whether there exists an operand bundle of type ID
+  bool hasOperandBundle(uint32_t ID) const {
+    return any_of(operand_bundles(),
+                  [&](OperandBundleUse OBU) { return OBU.getTagID() == ID; });
   }
 
   /// Populate the BundleOpInfo instances and the Use& vector from \p
